@@ -397,7 +397,7 @@
             <button onclick="instalarPWA()">Agregar a Pantalla Principal</button>
         </div>
 
-        <h2>Carga de Rendición - DirecTV</h2>
+        <h2>Carga de Rendición - Directv</h2>
         
         <!-- DATOS FIJOS DEL ENCABEZADO (se cargan una sola vez) -->
         <div id="resumen-fijo" class="resumen-fijo tab-hidden">
@@ -768,23 +768,76 @@
 
         // CROPPER JS LOGIC
         function procesarConRecorte(input, prefix) {
-            if (input.files && input.files[0]) {
-                activePrefix = prefix;
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const img = document.getElementById('imageToCrop');
-                    img.src = e.target.result;
-                    document.getElementById('cropModal').style.display = 'flex';
+            if (!(input.files && input.files[0])) return;
+            activePrefix = prefix;
+            const file = input.files[0];
+            reducirImagen(file, 1600).then(blob => {
+                if (urlRecorte) URL.revokeObjectURL(urlRecorte);
+                urlRecorte = URL.createObjectURL(blob);
+                const img = document.getElementById('imageToCrop');
+                img.src = urlRecorte;
+                document.getElementById('cropModal').style.display = 'flex';
+                if (cropper) cropper.destroy();
+                cropper = new Cropper(img, {
+                    viewMode: 1,
+                    autoCropArea: 0.9,
+                    responsive: true
+                });
+            }).catch(err => {
+                console.error('No se pudo procesar la foto:', err);
+                alert('No se pudo abrir la foto (el celular se quedó sin memoria o el formato no es compatible). Probá de nuevo, o sacala con menor resolución.');
+                input.value = '';
+            });
+        }
 
-                    if (cropper) cropper.destroy();
-                    cropper = new Cropper(img, {
-                        viewMode: 1,
-                        autoCropArea: 0.9,
-                        responsive: true
-                    });
-                };
-                reader.readAsDataURL(input.files[0]);
+        let urlRecorte = null;
+
+        // Achica la foto ANTES de recortarla: una foto de celular (12-50 MP) abierta completa agota la memoria
+        async function reducirImagen(file, maxLado) {
+            let w = 0, h = 0;
+            const u = URL.createObjectURL(file);
+            try {
+                await new Promise((res, rej) => {
+                    const i = new Image();
+                    i.onload = () => { w = i.naturalWidth; h = i.naturalHeight; res(); };
+                    i.onerror = () => rej(new Error('imagen no legible'));
+                    i.src = u;
+                });
+            } finally {
+                URL.revokeObjectURL(u);
             }
+            const k = Math.min(1, maxLado / Math.max(w, h));
+            const rw = Math.max(1, Math.round(w * k)), rh = Math.max(1, Math.round(h * k));
+            const canvas = document.createElement('canvas');
+            canvas.width = rw; canvas.height = rh;
+            const ctx = canvas.getContext('2d');
+            let hecho = false;
+            if (window.createImageBitmap) {
+                try {
+                    // decodifica ya reducida (no carga la foto completa en memoria)
+                    const bmp = await createImageBitmap(file, { resizeWidth: rw, resizeHeight: rh, resizeQuality: 'high', imageOrientation: 'from-image' });
+                    ctx.drawImage(bmp, 0, 0, rw, rh);
+                    if (bmp.close) bmp.close();
+                    hecho = true;
+                } catch (e) { /* se prueba el método alternativo */ }
+            }
+            if (!hecho) {
+                const u2 = URL.createObjectURL(file);
+                try {
+                    await new Promise((res, rej) => {
+                        const i = new Image();
+                        i.onload = () => { ctx.drawImage(i, 0, 0, rw, rh); res(); };
+                        i.onerror = () => rej(new Error('imagen no legible'));
+                        i.src = u2;
+                    });
+                } finally {
+                    URL.revokeObjectURL(u2);
+                }
+            }
+            const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.9));
+            canvas.width = canvas.height = 0; // libera memoria
+            if (!blob) throw new Error('no se pudo generar la imagen');
+            return blob;
         }
 
         function confirmarRecorte() {
@@ -809,6 +862,7 @@
                 cropper.destroy();
                 cropper = null;
             }
+            if (urlRecorte) { URL.revokeObjectURL(urlRecorte); urlRecorte = null; }
             document.getElementById(`${activePrefix}-foto`).value = '';
         }
 
