@@ -375,6 +375,32 @@
         .seg.active { border-color: #002f6c; background: #e3ebf7; color: #002f6c; }
         #form-ticket.solo-foto .grid-2 { grid-template-columns: 1fr; }
 
+        /* BOTONES DE FOTO (Cámara / Galería) y CÁMARA DENTRO DE LA APP */
+        .foto-botones { display: flex; gap: 8px; }
+        .foto-botones button {
+            flex: 1; padding: 13px 8px; border-radius: 8px; border: 1.5px solid #002f6c;
+            background: #ffffff; color: #002f6c; font-weight: bold; font-size: 14px;
+            font-family: Arial, sans-serif; cursor: pointer;
+        }
+        .foto-botones button:active { background: #e3ebf7; }
+        .aviso-foto {
+            display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px;
+            background: #fff4e0; border: 1px solid #f0c27a; color: #6b4400;
+            font-size: 12px; font-family: Arial, sans-serif; line-height: 1.4;
+        }
+        #camModal {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 10000; flex-direction: column; align-items: center;
+        }
+        #camModal video { width: 100%; flex: 1; min-height: 0; object-fit: contain; background: #000; }
+        #camModal .cam-barra {
+            display: flex; gap: 15px; width: 100%; max-width: 600px;
+            padding: 14px 15px calc(14px + env(safe-area-inset-bottom));
+        }
+        #camModal .cam-barra button {
+            flex: 1; padding: 15px; font-size: 15px; font-weight: bold; border-radius: 8px; border: none; cursor: pointer;
+        }
+
         @page { size: A4 portrait; margin: 0; }
 
         @media print {
@@ -491,11 +517,13 @@
                 <div>
                     <label id="lbl-foto">Foto del Ticket</label>
                     <div class="img-selector-box">
-                        <div class="img-selector-options">
-                            <label><input type="radio" name="tick-source" value="camera" checked onchange="toggleCamaraSource('tick')"> 📷 Sacar Foto</label>
-                            <label><input type="radio" name="tick-source" value="gallery" onchange="toggleCamaraSource('tick')"> 🖼️ Galería / Archivo</label>
+                        <div class="foto-botones">
+                            <button type="button" onclick="abrirCamara('tick')">📷 Cámara</button>
+                            <button type="button" onclick="abrirGaleria('tick')">🖼️ Galería</button>
                         </div>
-                        <input type="file" id="tick-foto" accept="image/*" capture="environment" onchange="procesarConRecorte(this, 'tick')">
+                        <div id="aviso-tick" class="aviso-foto"></div>
+                        <input type="file" id="tick-foto" accept="image/*" style="display:none" onchange="procesarConRecorte(this, 'tick')">
+                        <input type="file" id="tick-foto-cam" accept="image/*" capture="environment" style="display:none" onchange="procesarConRecorte(this, 'tick')">
 
                         <!-- VISTA PREVIA DE LA FOTO RECORTADA -->
                         <div id="preview-tick" class="preview-box">
@@ -522,6 +550,15 @@
     </div>
 
     <!-- MODAL PARA RECORTAR FOTO -->
+    <!-- CÁMARA DENTRO DE LA APP -->
+    <div id="camModal">
+        <video id="camVideo" autoplay playsinline muted></video>
+        <div class="cam-barra">
+            <button type="button" onclick="tomarFotoCamara()" style="background:#28a745; color:white;">📸 Tomar foto</button>
+            <button type="button" onclick="cerrarCamara()" style="background:#dc3545; color:white;">Cancelar</button>
+        </div>
+    </div>
+
     <div id="cropModal">
         <div class="crop-container">
             <img id="imageToCrop" src="">
@@ -756,36 +793,123 @@
             }
         }
 
-        function toggleCamaraSource(prefix) {
-            const radioSel = document.querySelector(`input[name="${prefix}-source"]:checked`).value;
-            const fileInput = document.getElementById(`${prefix}-foto`);
-            if (radioSel === 'camera') {
-                fileInput.setAttribute('capture', 'environment');
-            } else {
-                fileInput.removeAttribute('capture');
-            }
+        // ---------- FOTOS: cámara dentro de la app, galería y recorte ----------
+        function limpiarInputsFoto(prefix) {
+            ['-foto', '-foto-cam'].forEach(suf => {
+                const el = document.getElementById(prefix + suf);
+                if (el) el.value = '';
+            });
         }
 
+        function ocultarAviso(prefix) {
+            const a = document.getElementById('aviso-' + prefix);
+            if (a) { a.style.display = 'none'; a.innerHTML = ''; }
+        }
+
+        // Si la cámara de la app no se puede usar, se avisa y se ofrece la cámara del teléfono.
+        // Va con un botón aparte porque abrir un selector de archivos exige un toque del usuario.
+        function avisoCamara(prefix, txt) {
+            const a = document.getElementById('aviso-' + prefix);
+            a.innerHTML = esc(txt) + '<br><button type="button" class="btn-secondary" style="width:auto; margin:6px 0 0 0; padding:8px 12px;" onclick="document.getElementById(\'' + prefix + '-foto-cam\').click()">📷 Usar la cámara del teléfono</button>';
+            a.style.display = 'block';
+        }
+
+        function abrirGaleria(prefix) {
+            ocultarAviso(prefix);
+            document.getElementById(prefix + '-foto').click();
+        }
+
+        let streamCamara = null;
+        let prefijoCamara = 'tick';
+
+        function detenerCamara() {
+            if (streamCamara) {
+                streamCamara.getTracks().forEach(t => t.stop());
+                streamCamara = null;
+            }
+            const v = document.getElementById('camVideo');
+            if (v) v.srcObject = null;
+        }
+
+        function cerrarCamara() {
+            detenerCamara();
+            document.getElementById('camModal').style.display = 'none';
+        }
+
+        // La cámara de la app pide un video de ~1920 px: la foto nunca llega a los 12+ megapíxeles de la cámara del teléfono
+        async function abrirCamara(prefix) {
+            prefijoCamara = prefix;
+            ocultarAviso(prefix);
+            if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+                avisoCamara(prefix, 'Este navegador no permite abrir la cámara dentro de la app.');
+                return;
+            }
+            try {
+                detenerCamara();
+                streamCamara = await navigator.mediaDevices.getUserMedia({
+                    audio: false,
+                    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+                });
+            } catch (err) {
+                console.warn('Cámara de la app no disponible:', err);
+                const denegado = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
+                avisoCamara(prefix, denegado
+                    ? 'No hay permiso para usar la cámara dentro de la app (se puede dar en la configuración del navegador).'
+                    : 'No se pudo abrir la cámara dentro de la app.');
+                return;
+            }
+            const v = document.getElementById('camVideo');
+            v.srcObject = streamCamara;
+            document.getElementById('camModal').style.display = 'flex';
+            try { await v.play(); } catch (e) { /* el autoplay ya lo inicia */ }
+        }
+
+        function tomarFotoCamara() {
+            const v = document.getElementById('camVideo');
+            if (!v.videoWidth || !v.videoHeight) {
+                alert('La cámara todavía no está lista. Esperá un segundo y probá de nuevo.');
+                return;
+            }
+            const k = Math.min(1, 1600 / Math.max(v.videoWidth, v.videoHeight));
+            const w = Math.max(1, Math.round(v.videoWidth * k)), h = Math.max(1, Math.round(v.videoHeight * k));
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            c.getContext('2d').drawImage(v, 0, 0, w, h);
+            c.toBlob(blob => {
+                c.width = c.height = 0;
+                if (!blob) { alert('No se pudo sacar la foto. Probá de nuevo.'); return; }
+                activePrefix = prefijoCamara;
+                cerrarCamara();
+                abrirRecorte(blob);
+            }, 'image/jpeg', 0.92);
+        }
+
+        // Si la app pasa a segundo plano, se libera la cámara
+        document.addEventListener('visibilitychange', () => { if (document.hidden && streamCamara) cerrarCamara(); });
+
         // CROPPER JS LOGIC
+        function abrirRecorte(blob) {
+            if (urlRecorte) URL.revokeObjectURL(urlRecorte);
+            urlRecorte = URL.createObjectURL(blob);
+            const img = document.getElementById('imageToCrop');
+            img.src = urlRecorte;
+            document.getElementById('cropModal').style.display = 'flex';
+            if (cropper) cropper.destroy();
+            cropper = new Cropper(img, {
+                viewMode: 1,
+                autoCropArea: 0.9,
+                responsive: true
+            });
+        }
+
         function procesarConRecorte(input, prefix) {
             if (!(input.files && input.files[0])) return;
             activePrefix = prefix;
+            ocultarAviso(prefix);
             const file = input.files[0];
-            reducirImagen(file, 1600).then(blob => {
-                if (urlRecorte) URL.revokeObjectURL(urlRecorte);
-                urlRecorte = URL.createObjectURL(blob);
-                const img = document.getElementById('imageToCrop');
-                img.src = urlRecorte;
-                document.getElementById('cropModal').style.display = 'flex';
-                if (cropper) cropper.destroy();
-                cropper = new Cropper(img, {
-                    viewMode: 1,
-                    autoCropArea: 0.9,
-                    responsive: true
-                });
-            }).catch(err => {
+            reducirImagen(file, 1600).then(abrirRecorte).catch(err => {
                 console.error('No se pudo procesar la foto:', err);
-                alert('No se pudo abrir la foto (el celular se quedó sin memoria o el formato no es compatible). Probá de nuevo, o sacala con menor resolución.');
+                alert('No se pudo abrir la foto (el celular se quedó sin memoria o el formato no es compatible). Probá con el botón 📷 Cámara, o con una imagen más chica.');
                 input.value = '';
             });
         }
@@ -863,13 +987,13 @@
                 cropper = null;
             }
             if (urlRecorte) { URL.revokeObjectURL(urlRecorte); urlRecorte = null; }
-            document.getElementById(`${activePrefix}-foto`).value = '';
+            limpiarInputsFoto(activePrefix);
         }
 
         function cancelarFoto(prefix) {
             tempBase64[prefix] = null;
             document.getElementById(`preview-${prefix}`).style.display = 'none';
-            document.getElementById(`${prefix}-foto`).value = '';
+            limpiarInputsFoto(prefix);
         }
 
         function aplicarLogo() {
