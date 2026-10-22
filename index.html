@@ -546,6 +546,11 @@
             <span id="cant-lbl" style="font-size: 14px; font-weight: bold; color: #002f6c;">0 comprobantes cargados</span>
             <button onclick="window.print()" class="btn-primary">🖨 Generar PDF / Imprimir</button>
         </div>
+        <div class="action-bar-mobile" style="margin-top: 10px; display: flex; justify-content: center; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <button type="button" class="btn-secondary" onclick="exportarCopia()">💾 Exportar copia de seguridad</button>
+            <button type="button" class="btn-secondary" onclick="document.getElementById('input-importar').click()">📥 Importar copia</button>
+            <input type="file" id="input-importar" accept=".json,application/json" style="display:none" onchange="importarCopia(this)">
+        </div>
         </div>
     </div>
 
@@ -748,7 +753,7 @@
             aut: null
         };
 
-        window.onload = function() {
+        window.onload = async function() {
             const sel = document.getElementById('tick-categoria');
             sel.innerHTML = '';
             Object.keys(CUENTAS).forEach(cat => {
@@ -763,7 +768,7 @@
             document.getElementById('inp-fecha').value = hoy;
             document.getElementById('tick-fecha').value = hoy;
 
-            cargarGuardados();
+            await cargarGuardados();
             render();
         };
 
@@ -1262,7 +1267,7 @@
                                 <td style="text-align:center;">${f.orden}</td>
                                 <td style="text-align:center;">${formatearFecha(t.fecha)}</td>
                                 <td style="text-align:center;">${esc(t.comprobante)}</td>
-                                <td style="text-align:center;">${esc(t.detalle)} (${esc(t.categoria)}) <button class="btn-danger no-print" style="float:right;" onclick="eliminarTicket(${tickets.indexOf(t)})">X</button></td>
+                                <td style="text-align:center;">${esc(t.detalle)} <button class="btn-danger no-print" style="float:right;" onclick="eliminarTicket(${tickets.indexOf(t)})">X</button></td>
                                 <td class="excel-nd bg-gray-cell"></td>
                                 <td style="text-align:right;">${fmtMonto(Number(t.importe) || 0)}</td>
                             </tr>`;
@@ -1411,64 +1416,163 @@
             mostrarDatosFijos(false);
         }
 
-        function guardar() {
-            const data = {
-                custodio: document.getElementById('inp-custodio').value,
-                solicitante: document.getElementById('inp-solicitante').value,
-                re: document.getElementById('inp-re').value,
-                cc: document.getElementById('inp-cc').value,
-                gerencia: document.getElementById('inp-gerencia').value,
-                vehiculo: document.getElementById('inp-vehiculo').value,
-                fecha: document.getElementById('inp-fecha').value,
-                tickets: tickets
-            };
-            try {
-                const fijos = {};
-                CAMPOS_FIJOS.forEach(c => { fijos[c] = document.getElementById('inp-' + c).value; });
-                localStorage.setItem(CLAVE_ENCABEZADO, JSON.stringify(fijos));
-                localStorage.setItem('dtv_rendicion_data', JSON.stringify(data));
-            } catch (err) {
-                console.error('No se pudo guardar:', err);
-                if (!avisoStorageMostrado) {
-                    avisoStorageMostrado = true;
-                    alert('⚠️ El almacenamiento del navegador está lleno: los últimos cambios NO se están guardando. Generá el PDF ahora o reiniciá la rendición antes de seguir cargando fotos.');
-                }
+        // ---------- ALMACENAMIENTO ----------
+        // La rendición (datos + fotos) se guarda en IndexedDB, que admite mucho más que localStorage.
+        // Si el navegador no lo permite, se usa localStorage como respaldo. El encabezado fijo (chico) sigue en localStorage.
+        const DB_NOMBRE = 'rendiciones-db', DB_STORE = 'estado', DB_CLAVE = 'rendicion', CLAVE_DATOS_LS = 'dtv_rendicion_data';
+        let estadoCargado = false, timerGuardado = null;
+
+        function idbAbrir() {
+            return new Promise((resolve, reject) => {
+                if (!window.indexedDB) { reject(new Error('IndexedDB no disponible')); return; }
+                let r;
+                try { r = indexedDB.open(DB_NOMBRE, 1); } catch (e) { reject(e); return; }
+                r.onupgradeneeded = () => { r.result.createObjectStore(DB_STORE); };
+                r.onsuccess = () => resolve(r.result);
+                r.onerror = () => reject(r.error);
+                r.onblocked = () => reject(new Error('IndexedDB bloqueada'));
+            });
+        }
+        function idbLeer() {
+            return idbAbrir().then(db => new Promise((resolve, reject) => {
+                const rq = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(DB_CLAVE);
+                rq.onsuccess = () => { db.close(); resolve(rq.result || null); };
+                rq.onerror = () => { db.close(); reject(rq.error); };
+            }));
+        }
+        function idbEscribir(valor) {
+            return idbAbrir().then(db => new Promise((resolve, reject) => {
+                const tx = db.transaction(DB_STORE, 'readwrite');
+                tx.objectStore(DB_STORE).put(valor, DB_CLAVE);
+                tx.oncomplete = () => { db.close(); resolve(); };
+                tx.onerror = () => { db.close(); reject(tx.error); };
+                tx.onabort = () => { db.close(); reject(tx.error || new Error('transacción cancelada')); };
+            }));
+        }
+
+        function estadoActual() {
+            const d = {};
+            CAMPOS_FIJOS.forEach(c => { d[c] = document.getElementById('inp-' + c).value; });
+            d.fecha = document.getElementById('inp-fecha').value;
+            d.tickets = tickets;
+            return d;
+        }
+
+        function avisarAlmacenamientoLleno() {
+            if (!avisoStorageMostrado) {
+                avisoStorageMostrado = true;
+                alert('⚠️ No hay más espacio de almacenamiento: los últimos cambios NO se están guardando. Generá el PDF ahora, exportá una copia de seguridad o reiniciá la rendición antes de seguir cargando fotos.');
             }
         }
 
-        function cargarGuardados() {
+        function guardarAhora() {
+            if (!estadoCargado) return; // evita pisar lo guardado antes de terminar de cargarlo
+            clearTimeout(timerGuardado); timerGuardado = null;
+            const data = estadoActual();
+            try {
+                const fijos = {};
+                CAMPOS_FIJOS.forEach(c => { fijos[c] = data[c]; });
+                localStorage.setItem(CLAVE_ENCABEZADO, JSON.stringify(fijos));
+            } catch (err) { console.warn('No se pudo guardar el encabezado:', err); }
+            idbEscribir(data).then(() => {
+                try { localStorage.removeItem(CLAVE_DATOS_LS); } catch (e) {} // ya migrado: se libera el espacio viejo
+            }).catch(err => {
+                console.warn('IndexedDB falló, se usa localStorage:', err);
+                try { localStorage.setItem(CLAVE_DATOS_LS, JSON.stringify(data)); }
+                catch (e2) { console.error('No se pudo guardar:', e2); avisarAlmacenamientoLleno(); }
+            });
+        }
+
+        // Guarda con una pequeña espera para no escribir en cada tecla
+        function guardar() {
+            if (!estadoCargado) return;
+            clearTimeout(timerGuardado);
+            timerGuardado = setTimeout(guardarAhora, 250);
+        }
+        document.addEventListener('visibilitychange', () => { if (document.hidden && timerGuardado) guardarAhora(); });
+        window.addEventListener('pagehide', () => { if (timerGuardado) guardarAhora(); });
+
+        function aplicarDatos(data, completo) {
+            if (!data) return;
+            CAMPOS_FIJOS.forEach(c => {
+                if (completo || data[c]) document.getElementById('inp-' + c).value = data[c] || '';
+            });
+            if (data.fecha) document.getElementById('inp-fecha').value = data.fecha;
+            if (Array.isArray(data.tickets)) tickets = data.tickets;
+        }
+
+        async function cargarGuardados() {
             try { localStorage.removeItem('dtv_logo'); } catch (e) {} // el logo ahora viene incluido en la app
 
-            const dataStr = localStorage.getItem('dtv_rendicion_data');
-            if (dataStr) {
+            let data = null;
+            try { data = await idbLeer(); } catch (e) { console.warn('IndexedDB no disponible:', e); }
+            if (!data) { // primera vez con esta versión: se migra lo que había en localStorage
                 try {
-                    const data = JSON.parse(dataStr);
-                    if (data.custodio) document.getElementById('inp-custodio').value = data.custodio;
-                    if (data.solicitante) document.getElementById('inp-solicitante').value = data.solicitante;
-                    if (data.re) document.getElementById('inp-re').value = data.re;
-                    if (data.cc) document.getElementById('inp-cc').value = data.cc;
-                    if (data.gerencia) document.getElementById('inp-gerencia').value = data.gerencia;
-                    if (data.vehiculo) document.getElementById('inp-vehiculo').value = data.vehiculo;
-                    if (data.fecha) document.getElementById('inp-fecha').value = data.fecha;
-                    if (data.tickets) tickets = data.tickets;
-                } catch (e) {
-                    console.error("Error al cargar datos guardados:", e);
-                }
+                    const s = localStorage.getItem(CLAVE_DATOS_LS);
+                    if (s) data = JSON.parse(s);
+                } catch (e) { console.error('Error al cargar datos guardados:', e); }
             }
+            aplicarDatos(data, false);
 
             // Datos fijos del encabezado: se guardan aparte y no se borran al reiniciar la rendición
-            const fijosStr = localStorage.getItem(CLAVE_ENCABEZADO);
-            if (fijosStr) {
-                try {
+            try {
+                const fijosStr = localStorage.getItem(CLAVE_ENCABEZADO);
+                if (fijosStr) {
                     const f = JSON.parse(fijosStr);
                     CAMPOS_FIJOS.forEach(c => { if (f[c]) document.getElementById('inp-' + c).value = f[c]; });
-                } catch (e) {
-                    console.error("Error al cargar el encabezado:", e);
                 }
-            }
+            } catch (e) { console.error('Error al cargar el encabezado:', e); }
             const confirmado = localStorage.getItem('dtv_encabezado_ok') === '1';
             const completos = CAMPOS_FIJOS.every(c => document.getElementById('inp-' + c).value.trim());
             mostrarDatosFijos(!(confirmado && completos)); // la primera vez se muestra abierto para revisarlo
+
+            estadoCargado = true;
+            if (data) guardarAhora(); // completa la migración a IndexedDB
+            // Pide al navegador que no borre los datos de la app por falta de espacio
+            try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+        }
+
+        // ---------- COPIA DE SEGURIDAD ----------
+        function exportarCopia() {
+            const d = estadoActual();
+            const payload = { app: 'rendiciones-dtv', version: 1, exportado: new Date().toISOString(), datos: d };
+            const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'rendicion_' + (d.fecha || fechaHoyLocal()) + '.json';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 2000);
+        }
+
+        function importarCopia(input) {
+            const archivo = input.files && input.files[0];
+            input.value = '';
+            if (!archivo) return;
+            const lector = new FileReader();
+            lector.onerror = () => alert('No se pudo leer el archivo.');
+            lector.onload = () => {
+                let p;
+                try { p = JSON.parse(lector.result); } catch (e) { alert('El archivo no es una copia de seguridad válida.'); return; }
+                if (!p || p.app !== 'rendiciones-dtv' || !p.datos || !Array.isArray(p.datos.tickets)) {
+                    alert('El archivo no es una copia de seguridad de esta app.'); return;
+                }
+                const nuevos = p.datos.tickets.filter(t => t && typeof t === 'object').map(t => {
+                    const c = Object.assign({}, t);
+                    if (typeof c.foto !== 'string' || c.foto.indexOf('data:image/') !== 0) c.foto = '';
+                    return c;
+                });
+                const fechaCopia = p.datos.fecha || '—';
+                if (!confirm('Se va a REEMPLAZAR la rendición actual (' + tickets.length + ' comprobantes) por la de la copia (' + nuevos.length + ' comprobantes, fecha ' + fechaCopia + '). ¿Continuar?')) return;
+                aplicarDatos(Object.assign({}, p.datos, { tickets: nuevos }), true);
+                const completos = CAMPOS_FIJOS.every(c => document.getElementById('inp-' + c).value.trim());
+                if (completos) { try { localStorage.setItem('dtv_encabezado_ok', '1'); } catch (e) {} }
+                mostrarDatosFijos(!completos);
+                render();
+                guardarAhora();
+                alert('Copia importada: ' + nuevos.length + ' comprobantes.');
+            };
+            lector.readAsText(archivo);
         }
 
         function cerrarYReiniciar() {
